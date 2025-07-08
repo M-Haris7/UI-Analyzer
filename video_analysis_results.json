@@ -1,0 +1,133 @@
+{
+  "video_analysis": {
+    "video_path": "test_data\\outlook_flow_video.mp4",
+    "duration_seconds": 127.76166666666667,
+    "frames_analyzed": 80
+  },
+  "ui_flow_analysis": {
+    "flow_summary": "The user navigates through the app to create a new email account, entering personal information and completing a CAPTCHA.",
+    "interaction_patterns": [
+      "Account Creation",
+      "Form Filling",
+      "CAPTCHA Interaction"
+    ],
+    "screen_transitions": [
+      "Inbox",
+      "Navigation Drawer",
+      "Settings",
+      "Add Account",
+      "Email Entry",
+      "Password Entry",
+      "Name Entry",
+      "Country Selection",
+      "Date of Birth Entry",
+      "CAPTCHA",
+      "Terms Acceptance",
+      "Security Setup"
+    ],
+    "user_actions": [
+      {
+        "timestamp": 0.0,
+        "action_type": "tap",
+        "target": "Menu Button",
+        "description": "User taps on the menu button to open the navigation drawer."
+      },
+      {
+        "timestamp": 1.5,
+        "action_type": "tap",
+        "target": "Settings",
+        "description": "User selects 'Settings' from the navigation drawer."
+      },
+      {
+        "timestamp": 3.0,
+        "action_type": "tap",
+        "target": "Add Account",
+        "description": "User taps on 'Add Account' to start the account creation process."
+      },
+      {
+        "timestamp": 4.6,
+        "action_type": "type",
+        "target": "Email Field",
+        "description": "User types 'testaccount001' in the email field."
+      },
+      {
+        "timestamp": 6.1,
+        "action_type": "tap",
+        "target": "Next Button",
+        "description": "User taps 'Next' to proceed with account creation."
+      },
+      {
+        "timestamp": 7.6,
+        "action_type": "type",
+        "target": "Password Field",
+        "description": "User types a password in the password field."
+      },
+      {
+        "timestamp": 9.1,
+        "action_type": "tap",
+        "target": "Next Button",
+        "description": "User taps 'Next' after entering the password."
+      },
+      {
+        "timestamp": 10.6,
+        "action_type": "type",
+        "target": "Name Field",
+        "description": "User types 'Juan' in the name field."
+      },
+      {
+        "timestamp": 12.2,
+        "action_type": "type",
+        "target": "Surname Field",
+        "description": "User types 'Perez' in the surname field."
+      },
+      {
+        "timestamp": 13.7,
+        "action_type": "tap",
+        "target": "Next Button",
+        "description": "User taps 'Next' after entering name and surname."
+      },
+      {
+        "timestamp": 15.2,
+        "action_type": "tap",
+        "target": "Country Selector",
+        "description": "User selects 'Mexico' from the country list."
+      },
+      {
+        "timestamp": 16.7,
+        "action_type": "type",
+        "target": "Date of Birth",
+        "description": "User enters date of birth as '01/02/1990'."
+      },
+      {
+        "timestamp": 18.2,
+        "action_type": "tap",
+        "target": "Next Button",
+        "description": "User taps 'Next' after entering date of birth."
+      },
+      {
+        "timestamp": 19.8,
+        "action_type": "tap",
+        "target": "CAPTCHA Button",
+        "description": "User completes CAPTCHA by holding the button."
+      },
+      {
+        "timestamp": 21.3,
+        "action_type": "tap",
+        "target": "Accept Button",
+        "description": "User accepts terms and conditions."
+      },
+      {
+        "timestamp": 22.8,
+        "action_type": "tap",
+        "target": "Skip Button",
+        "description": "User skips additional security setup."
+      }
+    ]
+  },
+  "summary": {
+    "total_actions_identified": 16,
+    "total_patterns_found": 3,
+    "total_screen_transitions": 12,
+    "analysis_quality": "focused_and_accurate"
+  }
+}
