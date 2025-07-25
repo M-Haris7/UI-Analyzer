@@ -4,13 +4,17 @@ import json
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
-from langchain.schema import BaseMessage, HumanMessage
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+import google.generativeai as genai
+from PIL import Image
+import io
+import re
+from datetime import datetime
+
+load_dotenv()
 
 # Data models for structured output
 @dataclass
@@ -22,98 +26,72 @@ class UIElement:
     confidence: float
     properties: Dict[str, any]
 
-class UIAnalysisResult(BaseModel):
-    """Structured result from UI analysis"""
-    ui_elements: List[Dict] = Field(description="List of detected UI elements with their properties")
-    screen_type: str = Field(description="Type of screen (login, home, settings, etc.)")
-    interaction_areas: List[Dict] = Field(description="Areas where user can interact")
-    text_content: List[str] = Field(description="All readable text on screen")
-    layout_description: str = Field(description="Overall layout description")
-
 class UserAction(BaseModel):
     """Represents a user action in the recording"""
     timestamp: float = Field(description="Time in seconds when action occurred")
     action_type: str = Field(description="Type of action (tap, swipe, scroll, type)")
-    target_element: str = Field(description="Description of target UI element")
-    coordinates: Tuple[int, int] = Field(description="Action coordinates")
+    target: str = Field(description="Description of target UI element")
     description: str = Field(description="Human-readable action description")
 
-class InteractionFlow(BaseModel):
-    """Represents the complete interaction flow"""
-    actions: List[UserAction] = Field(description="Sequence of user actions")
-    flow_summary: str = Field(description="Summary of the interaction flow")
-    patterns: List[str] = Field(description="Identified interaction patterns")
-    screen_transitions: List[str] = Field(description="Screen transition sequence")
+class VideoAnalysisResults(BaseModel):
+    """Complete video analysis results matching the expected format"""
+    video_analysis: Dict = Field(description="Video metadata and analysis info")
+    ui_flow_analysis: Dict = Field(description="Detailed UI flow analysis")
+    summary: Dict = Field(description="Analysis summary statistics")
 
 class AndroidUIAnalyzer:
     """Main class for analyzing Android UI recordings and screenshots"""
     
-    def __init__(self, openai_api_key: str, model_name: str = "gpt-4o"):
-        self.llm = ChatOpenAI(
-            api_key=openai_api_key,
-            model=model_name,
+    def __init__(self, gemini_api_key: str, model_name: str = "gemini-2.5-pro"):
+        """
+        Initialize with Gemini 2.0 Flash
+        Available models:
+        - gemini-2.0-flash-exp (latest experimental model)
+        - gemini-1.5-flash (stable version)
+        - gemini-1.5-pro (more capable, multimodal)
+        """
+        try:
+            genai.configure(api_key=gemini_api_key)
+            self.model = genai.GenerativeModel(model_name)
+            self.model_name = model_name
+            print(f"✅ Initialized with {model_name}")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize {model_name}, falling back to gemini-1.5-flash")
+            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            self.model_name = "gemini-1.5-flash"
+        
+        # Generation config for consistent responses
+        self.generation_config = genai.types.GenerationConfig(
             temperature=0.1,
-            max_tokens=4000
+            max_output_tokens=8000,  # Increased for detailed responses
+            candidate_count=1
         )
-        
-        # Output parsers for structured responses
-        self.ui_parser = PydanticOutputParser(pydantic_object=UIAnalysisResult)
-        self.flow_parser = PydanticOutputParser(pydantic_object=InteractionFlow)
-        
-        # Prompts for different analysis tasks
-        self.ui_analysis_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert Android UI analyzer. Analyze the provided screenshot and identify:
-            1. All UI elements (buttons, text fields, images, CAPTCHA handling, navigation elements)
-            2. Their locations and properties
-            3. Screen type and layout
-            4. Interactive areas
-            5. All readable text content
-            
-            Be precise with coordinates and comprehensive in element detection.
-            
-            {format_instructions}"""),
-            ("human", "Analyze this Android screenshot and provide detailed UI analysis.")
-        ])
-        
-        self.flow_analysis_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert in mobile UX analysis. Analyze the sequence of screenshots from a screen recording to understand:
-            1. User interaction patterns
-            2. Action sequences and timing
-            3. Screen transitions
-            4. UI flow logic
-            5. Common interaction patterns
-            
-            Focus on understanding the logical flow of user actions and identifying repeatable patterns.
-            
-            {format_instructions}"""),
-            ("human", "Analyze this sequence of Android screenshots to understand the user interaction flow.")
-        ])
 
-    def encode_frame_to_base64(self, frame: np.ndarray) -> str:
-        """Convert numpy frame to base64 for API consumption"""
-        # Encode frame as JPEG
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return base64.b64encode(buffer).decode('utf-8')
+    def numpy_to_pil(self, frame: np.ndarray) -> Image.Image:
+        """Convert numpy frame to PIL Image"""
+        # Convert BGR to RGB (OpenCV uses BGR, PIL expects RGB)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb_frame)
 
     def calculate_optimal_frames(self, duration: float) -> int:
         """Calculate optimal number of frames based on video duration"""
         if duration <= 5:          # Very short: 0-5 seconds
-            return 6
-        elif duration <= 10:       # Short: 5-10 seconds  
             return 8
+        elif duration <= 10:       # Short: 5-10 seconds  
+            return 12
         elif duration <= 20:       # Medium: 10-20 seconds
-            return 10
-        elif duration <= 30:       # Medium-long: 20-30 seconds
             return 20
+        elif duration <= 30:       # Medium-long: 20-30 seconds
+            return 30
         elif duration <= 60:       # Long: 30-60 seconds (1 minute)
-            return 35
-        elif duration <= 120:      # Very long: 1-2 minutes
             return 50
-        else:                      # Extra long: 2+ minutes
+        elif duration <= 120:      # Very long: 1-2 minutes
             return 80
+        else:                      # Extra long: 2+ minutes
+            return 100
 
     def extract_key_frames_from_video(self, video_path: str) -> Tuple[List[np.ndarray], List[float]]:
-        """Dynamic frame extraction based on video duration and content"""
+        """Extract key frames from video for multimodal analysis"""
         cap = cv2.VideoCapture(video_path)
         
         # Get video properties
@@ -126,26 +104,24 @@ class AndroidUIAnalyzer:
         
         print(f"📊 Video: {duration:.1f}s → Selecting {optimal_frames} frames")
         
-        # Dynamic frame selection strategy
+        # Intelligent frame selection for better analysis
         if duration <= 10:
-            # Short videos: Even distribution
+            # For short videos, sample evenly
             frame_indices = [int(i * total_frames / optimal_frames) for i in range(optimal_frames)]
+        elif duration <= 60:
+            # For medium videos, focus on key moments
+            beginning_frames = int(optimal_frames * 0.3)
+            middle_frames = int(optimal_frames * 0.4)
+            end_frames = optimal_frames - beginning_frames - middle_frames
             
-        elif duration <= 30:
-            # Medium videos: Focus on beginning and end with some middle coverage
-            beginning_frames = int(optimal_frames * 0.4)  # 40% at beginning
-            middle_frames = int(optimal_frames * 0.3)     # 30% in middle
-            end_frames = optimal_frames - beginning_frames - middle_frames  # 30% at end
-            
-            start_indices = [int(i * total_frames * 0.3 / beginning_frames) for i in range(beginning_frames)]
-            middle_indices = [int(total_frames * 0.35 + i * total_frames * 0.3 / middle_frames) for i in range(middle_frames)]
-            end_indices = [int(total_frames * 0.7 + i * total_frames * 0.3 / end_frames) for i in range(end_frames)]
+            start_indices = [int(i * total_frames * 0.25 / beginning_frames) for i in range(beginning_frames)]
+            middle_indices = [int(total_frames * 0.25 + i * total_frames * 0.5 / middle_frames) for i in range(middle_frames)]
+            end_indices = [int(total_frames * 0.75 + i * total_frames * 0.25 / end_frames) for i in range(end_frames)]
             
             frame_indices = start_indices + middle_indices + end_indices
-            
         else:
-            # Long videos: Segmented approach with consistent sampling
-            segments = min(6, int(duration / 10))  # One segment per ~10 seconds, max 6 segments
+            # For long videos, use segmented approach
+            segments = min(8, int(duration / 15))
             frames_per_segment = optimal_frames // segments
             remaining_frames = optimal_frames % segments
             
@@ -155,12 +131,10 @@ class AndroidUIAnalyzer:
                 segment_end = int((segment + 1) * total_frames / segments)
                 segment_frames = frames_per_segment + (1 if segment < remaining_frames else 0)
                 
-                # Sample evenly within each segment
                 for i in range(segment_frames):
                     frame_idx = segment_start + int(i * (segment_end - segment_start) / segment_frames)
                     frame_indices.append(frame_idx)
         
-        # Remove duplicates and sort
         frame_indices = sorted(list(set(frame_indices)))
         
         # Extract frames
@@ -175,7 +149,7 @@ class AndroidUIAnalyzer:
                 key_frames.append(frame)
                 timestamp = frame_idx / frame_rate
                 timestamps.append(timestamp)
-                if i < 5 or i >= len(frame_indices) - 2:  # Show first 5 and last 2
+                if i < 5 or i >= len(frame_indices) - 2:
                     print(f"   📸 Frame {i+1}: {timestamp:.1f}s")
                 elif i == 5:
                     print(f"   📸 ... (extracting {len(frame_indices)-7} more frames) ...")
@@ -184,244 +158,226 @@ class AndroidUIAnalyzer:
         print(f"✅ Successfully extracted {len(key_frames)} frames")
         return key_frames, timestamps
 
-    # Remove the motion detection methods since we're not using them anymore
+    def create_detailed_analysis_prompt(self, frames_count: int, timestamps: List[float]) -> str:
+        """Create a comprehensive prompt for detailed analysis"""
+        return f"""You are an expert Android UI/UX analyst with deep experience in mobile app flow analysis. Analyze this sequence of {frames_count} screenshots from an Android app recording.
 
-    def analyze_video_flow_directly(self, frames: List[np.ndarray], timestamps: List[float]) -> InteractionFlow:
-        """Analyze video frames directly with focus on accuracy and essential information"""
-        
-        print("🧠 Analyzing UI flow and interaction patterns...")
-        
-        # Encode frames to base64
-        encoded_frames = []
-        for i, frame in enumerate(frames):
-            base64_frame = self.encode_frame_to_base64(frame)
-            encoded_frames.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_frame}",
-                    "detail": "high"
-                }
-            })
-        
-        # Enhanced prompt for accuracy - focus on essential UI analysis
-        enhanced_prompt = f"""You are an expert Android UI/UX analyst. Analyze this sequence of {len(frames)} screenshots from an Android app recording. The app recording is in Spanish so detect the UI flow and translate the with high accuracy.
+**VIDEO DETAILS:**
+- Total frames: {frames_count}
+- Duration: {timestamps[-1] - timestamps[0]:.1f} seconds  
+- Timestamps: {[f"{t:.1f}s" for t in timestamps[:10]]}{'...' if len(timestamps) > 10 else ''}
 
-FRAME SEQUENCE: {len(frames)} frames over {timestamps[-1] - timestamps[0]:.1f} seconds
-TIMESTAMPS: {[f"{t:.1f}s" for t in timestamps]}
+**ANALYSIS REQUIREMENTS:**
 
-ANALYZE FOR:
+Provide a comprehensive analysis in the EXACT JSON format below. Be extremely detailed and accurate:
 
-1. **UI FLOW & NAVIGATION**:
-   - What screens/views are shown in sequence?
-   - How does the user navigate between screens?
-   - What is the logical flow of the app usage?
+```json
+{{
+  "video_analysis": {{
+    "video_path": "test_data/video_name.mp4",
+    "duration_seconds": {timestamps[-1] - timestamps[0]:.1f},
+    "frames_analyzed": {frames_count}
+  }},
+  "ui_flow_analysis": {{
+    "flow_summary": "Detailed 2-3 sentence summary of what the user accomplishes in this video",
+    "interaction_patterns": [
+      "Pattern1 (e.g., Account Creation, Form Filling, Navigation)",
+      "Pattern2", 
+      "Pattern3"
+    ],
+    "screen_transitions": [
+      "Screen1 (starting screen)",
+      "Screen2",
+      "Screen3",
+      "etc..."
+    ],
+    "user_actions": [
+      {{
+        "timestamp": 0.0,
+        "action_type": "tap|swipe|scroll|type|long_press",
+        "target": "Specific UI element name",
+        "description": "Detailed description of what the user does"
+      }}
+    ]
+  }},
+  "summary": {{
+    "total_actions_identified": 0,
+    "total_patterns_found": 0,
+    "total_screen_transitions": 0,
+    "analysis_quality": "focused_and_accurate|comprehensive|detailed"
+  }}
+}}
+```
 
-2. **USER ACTIONS**:
-   - What specific actions does the user perform?
-   - What buttons does the user click?
-   - When do these actions occur in the sequence?
-   - What triggers each screen transition?
+**DETAILED ANALYSIS INSTRUCTIONS:**
 
-3. **INTERACTION PATTERNS**:
-   - What type of app interaction pattern is this? (login flow, search, navigation, form filling, etc.)
-   - What UI components are being used? (buttons, forms, lists, menus, etc.)
-   - Are there any CAPTCHA that the user interacts with?
-   - What is the user trying to accomplish?
+1. **FLOW SUMMARY**: Write a clear, detailed summary explaining the overall user journey and what they accomplish.
 
-4. **SCREEN TRANSITIONS**:
-   - What are the distinct screens or states shown?
-   - How do screens change from one to another?
-   - What causes each transition?
+2. **INTERACTION PATTERNS**: Identify high-level patterns like:
+   - Account Creation, Login Flow, Form Filling
+   - Navigation, Search, Content Browsing  
+   - Settings Configuration, Profile Setup
+   - CAPTCHA Interaction, Security Setup
+   - Shopping Flow, Payment Process
 
-Be specific and accurate. Focus on the actual UI elements and user journey, not technical details.
+3. **SCREEN TRANSITIONS**: List each distinct screen/view in chronological order:
+   - Start with the initial screen shown
+   - Include intermediate screens/dialogs
+   - End with the final screen reached
+   - Use clear, descriptive names
 
-{self.flow_parser.get_format_instructions()}"""
-        
-        # Create message content
-        message_content = [enhanced_prompt]
-        message_content.extend(encoded_frames)
-        
-        messages = [HumanMessage(content=message_content)]
-        
-        response = self.llm.invoke(messages)
-        
+4. **USER ACTIONS**: For each user interaction, provide:
+   - **timestamp**: Estimated time when action occurs (based on frame timing)
+   - **action_type**: tap, swipe, scroll, type, long_press
+   - **target**: Specific UI element (button name, field name, menu item)
+   - **description**: Clear explanation of what the user does
+
+**IMPORTANT NOTES:**
+- The app content may be in Spanish - translate UI elements to English for clarity
+- Focus on user intent and actions, not just screen content
+- Estimate timestamps based on frame sequence and timing
+- Be specific about UI elements (button names, field labels, etc.)
+- Identify CAPTCHAs, form validations, error states
+- Note any security or verification steps
+
+Return ONLY the JSON response with no additional text or formatting."""
+
+    def clean_and_parse_json_response(self, response_text: str) -> Dict:
+        """Clean and parse JSON response from Gemini"""
         try:
-            content_str = response.content if isinstance(response.content, str) else json.dumps(response.content)
-            return self.flow_parser.parse(content_str)
-        except Exception as e:
-            print(f"❌ Error parsing analysis: {e}")
-            return InteractionFlow(
-                actions=[],
-                flow_summary="Analysis failed - please try again",
-                patterns=[],
-                screen_transitions=[]
-            )
+            # Remove any markdown formatting
+            response_text = response_text.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text[7:]
+            if response_text.endswith('```'):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            # Try to find JSON content between braces
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            
+            if json_start != -1 and json_end > json_start:
+                json_content = response_text[json_start:json_end]
+                return json.loads(json_content)
+            else:
+                # Try parsing the entire response
+                return json.loads(response_text)
+                
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON parsing failed: {e}")
+            print(f"Response preview: {response_text[:200]}...")
+            return self.create_fallback_analysis(response_text)
 
-    def analyze_screenshot(self, image_path: str) -> UIAnalysisResult:
-        """Analyze a single screenshot for UI elements"""
-        base64_image = self.encode_image_to_base64(image_path)
-        
-        # Format the prompt with parser instructions
-        formatted_prompt = self.ui_analysis_prompt.format_messages(
-            format_instructions=self.ui_parser.get_format_instructions()
-        )
-        
-        # Add the image to the message
-        message_content = [
-            {"type": "text", "text": formatted_prompt[1].content},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}",
-                    "detail": "high"
-                }
+    def create_fallback_analysis(self, response_text: str) -> Dict:
+        """Create a fallback analysis structure when JSON parsing fails"""
+        return {
+            "video_analysis": {
+                "video_path": "test_data/analyzed_video.mp4",
+                "duration_seconds": 0.0,
+                "frames_analyzed": 0
+            },
+            "ui_flow_analysis": {
+                "flow_summary": "Analysis parsing failed. Raw response captured for review.",
+                "interaction_patterns": ["Parsing Error"],
+                "screen_transitions": ["Unknown"],
+                "user_actions": [
+                    {
+                        "timestamp": 0.0,
+                        "action_type": "unknown",
+                        "target": "Unknown",
+                        "description": f"Raw response: {response_text[:200]}..."
+                    }
+                ]
+            },
+            "summary": {
+                "total_actions_identified": 0,
+                "total_patterns_found": 1,
+                "total_screen_transitions": 1,
+                "analysis_quality": "parsing_failed"
             }
-        ]
-        
-        messages = [
-            formatted_prompt[0],  # System message
-            HumanMessage(content=message_content)
-        ]
-        
-        response = self.llm.invoke(messages)
-        
-        try:
-            return self.ui_parser.parse(response.content)
-        except Exception as e:
-            print(f"Error parsing UI analysis: {e}")
-            return UIAnalysisResult(
-                ui_elements=[],
-                screen_type="unknown",
-                interaction_areas=[],
-                text_content=[],
-                layout_description="Analysis failed"
-            )
+        }
 
-    def analyze_interaction_flow(self, screenshots: List[str], motion_data: Optional[List] = None) -> InteractionFlow:
-        """Analyze sequence of screenshots to understand interaction flow"""
+    def analyze_video_flow_with_gemini(self, frames: List[np.ndarray], timestamps: List[float], video_path: str) -> Dict:
+        """Analyze video frames with Gemini 2.0 Flash for detailed JSON output"""
         
-        # Encode all screenshots
-        encoded_images = []
-        for screenshot_path in screenshots:
-            base64_image = self.encode_image_to_base64(screenshot_path)
-            encoded_images.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}",
-                    "detail": "high"
-                }
-            })
+        print(f"🧠 Analyzing UI flow using {self.model_name}...")
         
-        # Format the prompt
-        formatted_prompt = self.flow_analysis_prompt.format_messages(
-            format_instructions=self.flow_parser.get_format_instructions()
-        )
+        # Convert frames to PIL Images
+        pil_images = [self.numpy_to_pil(frame) for frame in frames]
         
-        # Create message content with all images
-        message_content = [{"type": "text", "text": formatted_prompt[1].content}]
-        message_content.extend(encoded_images)
-        
-        # Add motion data if available
-        if motion_data:
-            message_content.append({
-                "type": "text",
-                "text": f"Motion detection data: {json.dumps(motion_data)}"
-            })
-        
-        messages = [
-            formatted_prompt[0],  # System message
-            HumanMessage(content=message_content)
-        ]
-        
-        response = self.llm.invoke(messages)
+        # Create detailed analysis prompt
+        prompt = self.create_detailed_analysis_prompt(len(frames), timestamps)
         
         try:
-            return self.flow_parser.parse(response.content)
-        except Exception as e:
-            print(f"Error parsing flow analysis: {e}")
-            return InteractionFlow(
-                actions=[],
-                flow_summary="Analysis failed",
-                patterns=[],
-                screen_transitions=[]
+            # Create content with text and images
+            content = [prompt] + pil_images
+            
+            print("🔍 Sending frames to Gemini for analysis...")
+            
+            # Generate response
+            response = self.model.generate_content(
+                content,
+                generation_config=self.generation_config
             )
+            
+            # Parse the response
+            response_text = response.text
+            print("📝 Parsing Gemini response...")
+            
+            analysis_result = self.clean_and_parse_json_response(response_text)
+            
+            # Update video path with actual path
+            if "video_analysis" in analysis_result:
+                analysis_result["video_analysis"]["video_path"] = video_path
+                analysis_result["video_analysis"]["duration_seconds"] = timestamps[-1] - timestamps[0]
+                analysis_result["video_analysis"]["frames_analyzed"] = len(frames)
+            
+            # Ensure summary statistics are correct
+            if "ui_flow_analysis" in analysis_result and "summary" in analysis_result:
+                ui_analysis = analysis_result["ui_flow_analysis"]
+                analysis_result["summary"]["total_actions_identified"] = len(ui_analysis.get("user_actions", []))
+                analysis_result["summary"]["total_patterns_found"] = len(ui_analysis.get("interaction_patterns", []))
+                analysis_result["summary"]["total_screen_transitions"] = len(ui_analysis.get("screen_transitions", []))
+            
+            return analysis_result
+            
+        except Exception as e:
+            print(f"❌ Error during Gemini analysis: {e}")
+            return self.create_fallback_analysis(f"Analysis failed: {str(e)}")
 
     def process_screen_recording(self, video_path: str) -> Dict:
-        """Streamlined processing pipeline focused on accuracy and essential information"""
+        """Process video recording using Gemini 2.0 Flash with detailed output"""
         
-        print("🎬 Starting focused video analysis...")
+        print("🎬 Starting comprehensive video analysis with Gemini 2.0 Flash...")
         
-        # Extract key frames with dynamic selection
+        # Extract key frames
         key_frames, timestamps = self.extract_key_frames_from_video(video_path)
         
-        # Analyze UI flow directly (no motion detection complexity)
-        print("🔍 Analyzing UI flow and patterns...")
-        flow_analysis = self.analyze_video_flow_directly(key_frames, timestamps)
+        # Analyze UI flow with detailed JSON output
+        print("🔍 Performing detailed UI flow analysis...")
+        detailed_analysis = self.analyze_video_flow_with_gemini(key_frames, timestamps, video_path)
         
-        # Get basic video info
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        duration = total_frames / fps
-        cap.release()
-        
-        return {
-            "video_path": video_path,
-            "video_duration_seconds": duration,
-            "frames_analyzed": len(key_frames),
-            "interaction_flow": flow_analysis,
-            "summary": {
-                "total_actions": len(flow_analysis.actions),
-                "total_patterns": len(flow_analysis.patterns),
-                "total_screen_transitions": len(flow_analysis.screen_transitions),
-                "analysis_method": "focused_ui_analysis"
-            }
-        }
-
-    def process_screenshots(self, screenshot_paths: List[str]) -> Dict:
-        """Process a list of screenshots"""
-        print(f"Analyzing {len(screenshot_paths)} screenshots...")
-        
-        ui_analyses = []
-        for i, screenshot_path in enumerate(screenshot_paths):
-            print(f"Analyzing screenshot {i+1}/{len(screenshot_paths)}")
-            analysis = self.analyze_screenshot(screenshot_path)
-            ui_analyses.append({
-                "screenshot_path": screenshot_path,
-                "analysis": analysis
-            })
-        
-        print("Analyzing interaction flow...")
-        flow_analysis = self.analyze_interaction_flow(screenshot_paths)
-        
-        return {
-            "screenshots": screenshot_paths,
-            "ui_analyses": ui_analyses,
-            "interaction_flow": flow_analysis,
-            "summary": {
-                "screens_analyzed": len(screenshot_paths),
-                "actions_identified": len(flow_analysis.actions),
-                "patterns_found": flow_analysis.patterns
-            }
-        }
+        return detailed_analysis
 
 def main():
-    print("🔍 Android UI Analyzer - Auto Video Analysis")
-    print("=" * 50)
+    print("🔍 Android UI Analyzer - Gemini 2.0 Flash Version")
+    print("=" * 55)
     
     # Get API key from environment
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("❌ No API key found. Please set OPENAI_API_KEY in your .env file.")
+        print("❌ No API key found. Please set GEMINI_API_KEY in your .env file.")
+        print("💡 Get your free API key at: https://aistudio.google.com/app/apikey")
         return
     
-    # Look for MP4 files in test_data folder
+    # Look for video files in test_data folder
     test_data_dir = Path("test_data")
     if not test_data_dir.exists():
         print("❌ test_data folder not found. Please create it and add your MP4 file.")
         return
     
-    # Find all MP4 files
+    # Find all video files
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
     video_files = []
     for ext in video_extensions:
@@ -438,78 +394,63 @@ def main():
     print(f"📹 Found video: {video_path}")
     
     try:
-        # Initialize the analyzer
-        print("🚀 Initializing Android UI Analyzer...")
-        analyzer = AndroidUIAnalyzer(openai_api_key=api_key)
+        # Initialize the analyzer with Gemini 2.0 Flash
+        print("🚀 Initializing Android UI Analyzer with Gemini 2.0 Flash...")
+        analyzer = AndroidUIAnalyzer(gemini_api_key=api_key)
         print("✅ Analyzer initialized successfully!")
+        print(f"🎯 Using {analyzer.model_name} for comprehensive image analysis")
         
-        # Process the video with focused analysis
+        # Process the video
         print(f"\n🔄 Analyzing video: {video_path}")
         results = analyzer.process_screen_recording(video_path)
         
         print("\n🎉 ANALYSIS COMPLETED!")
-        print("=" * 50)
+        print("=" * 55)
         
-        # Essential results only
-        print(f"📱 Video Duration: {results['video_duration_seconds']:.1f} seconds")
-        print(f"🔍 Frames Analyzed: {results['frames_analyzed']}")
-        print(f"👆 Actions Identified: {results['summary']['total_actions']}")
-        print(f"🔄 Screen Transitions: {results['summary']['total_screen_transitions']}")
-        print(f"📋 Patterns Found: {results['summary']['total_patterns']}")
+        # Display essential results
+        video_analysis = results.get("video_analysis", {})
+        ui_analysis = results.get("ui_flow_analysis", {})
+        summary = results.get("summary", {})
         
-        # Print interaction flow
-        flow = results['interaction_flow']
+        print(f"📱 Video Duration: {video_analysis.get('duration_seconds', 0):.1f} seconds")
+        print(f"🔍 Frames Analyzed: {video_analysis.get('frames_analyzed', 0)}")
+        print(f"👆 Actions Identified: {summary.get('total_actions_identified', 0)}")
+        print(f"🔄 Screen Transitions: {summary.get('total_screen_transitions', 0)}")
+        print(f"📋 Patterns Found: {summary.get('total_patterns_found', 0)}")
+        
+        # Print detailed flow analysis
         print(f"\n📋 FLOW SUMMARY:")
-        print(f"   {flow.flow_summary}")
+        print(f"   {ui_analysis.get('flow_summary', 'No summary available')}")
         
-        if flow.patterns:
+        patterns = ui_analysis.get('interaction_patterns', [])
+        if patterns:
             print(f"\n🔍 INTERACTION PATTERNS:")
-            for i, pattern in enumerate(flow.patterns, 1):
+            for i, pattern in enumerate(patterns, 1):
                 print(f"   {i}. {pattern}")
         
-        if flow.screen_transitions:
+        transitions = ui_analysis.get('screen_transitions', [])
+        if transitions:
             print(f"\n🔄 SCREEN TRANSITIONS:")
-            for i, transition in enumerate(flow.screen_transitions, 1):
+            for i, transition in enumerate(transitions, 1):
                 print(f"   {i}. {transition}")
         
-        if flow.actions:
+        actions = ui_analysis.get('user_actions', [])
+        if actions:
             print(f"\n👆 USER ACTIONS:")
-            for i, action in enumerate(flow.actions, 1):
-                print(f"   {i}. [{action.timestamp:.1f}s] {action.action_type}: {action.description}")
+            for i, action in enumerate(actions, 1):
+                timestamp = action.get('timestamp', 0)
+                action_type = action.get('action_type', 'unknown')
+                description = action.get('description', 'No description')
+                print(f"   {i}. [{timestamp:.1f}s] {action_type}: {description}")
         
-        # Save clean, essential results only
-        output_file = "video_analysis_results.json"
-        with open(output_file, "w") as f:
-            clean_results = {
-                "video_analysis": {
-                    "video_path": results["video_path"],
-                    "duration_seconds": results["video_duration_seconds"],
-                    "frames_analyzed": results["frames_analyzed"]
-                },
-                "ui_flow_analysis": {
-                    "flow_summary": flow.flow_summary,
-                    "interaction_patterns": flow.patterns,
-                    "screen_transitions": flow.screen_transitions,
-                    "user_actions": [
-                        {
-                            "timestamp": action.timestamp,
-                            "action_type": action.action_type,
-                            "target": action.target_element,
-                            "description": action.description
-                        } for action in flow.actions
-                    ]
-                },
-                "summary": {
-                    "total_actions_identified": len(flow.actions),
-                    "total_patterns_found": len(flow.patterns),
-                    "total_screen_transitions": len(flow.screen_transitions),
-                    "analysis_quality": "focused_and_accurate"
-                }
-            }
-            json.dump(clean_results, f, indent=2)
+        # Save detailed results
+        output_file = "gemini_2_detailed_analysis_results.json"
+        with open(output_file, "w", encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
         
-        print(f"\n💾 Clean results saved to: {output_file}")
-        print(f"✨ Analysis focused on essential UI flow information")
+        print(f"\n💾 Detailed results saved to: {output_file}")
+        print(f"✨ Analysis completed using {analyzer.model_name}")
+        print("🎯 Generated comprehensive JSON matching your required format!")
         
     except Exception as e:
         print(f"❌ Error during analysis: {e}")
